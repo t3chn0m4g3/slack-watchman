@@ -6,9 +6,19 @@ import requests
 import time
 import yaml
 from requests.exceptions import HTTPError
+from requests.packages.urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
 from slack_watchman import config as cfg
 from slack_watchman import logger
+
+
+class ScopeError(Exception):
+    pass
+
+
+class SlackAPIError(Exception):
+    pass
 
 
 class SlackAPI(object):
@@ -21,7 +31,7 @@ class SlackAPI(object):
         self.limit = 1
         self.pretty = 1
         self.session = session = requests.session()
-        session.mount(self.base_url, requests.adapters.HTTPAdapter())
+        session.mount(self.base_url, HTTPAdapter(max_retries=Retry(connect=3, backoff_factor=1)))
         session.headers.update({'Connection': 'keep-alive, close',
                                 'Authorization': 'Bearer {}'.format(self.token),
                                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5)\
@@ -33,7 +43,12 @@ class SlackAPI(object):
             response = self.session.request(method, relative_url, params=params, data=data, verify=verify_ssl)
             response.raise_for_status()
 
-            return response
+            if not response.json().get('ok') and response.json().get('error') == 'missing_scope':
+                raise ScopeError()
+            elif not response.json().get('ok'):
+                raise SlackAPIError()
+            else:
+                return response
 
         except HTTPError as http_error:
             if response.status_code == 429:
@@ -41,17 +56,28 @@ class SlackAPI(object):
                 time.sleep(90)
                 return self.session.request(method, relative_url, params=params, data=data, verify=verify_ssl)
             else:
-                print('HTTPError: {}'.format(http_error))
+                raise HTTPError('HTTPError: {}'.format(http_error))
+        except ScopeError:
+            raise ScopeError('Missing required scope: {}'.format(response.json().get('needed')))
+        except SlackAPIError:
+            raise SlackAPIError('Slack API Error: {}'.format(response.json().get('error')))
         except Exception as e:
-            print(e)
+            raise Exception(e)
 
-    def validate_token(self):
-        """Check that slack token is valid"""
+    def get_user_info(self, user_id):
+        """Get the user for the given ID"""
 
-        r = self.make_request('users.list').json()
+        params = {
+            'user': user_id
+        }
 
-        if not r.get('ok') and r.get('error') == 'invalid_auth':
-            raise Exception('Invalid Slack API key')
+        r = self.make_request('users.info', params=params).json()
+
+        if str(r.get('ok')) == 'False':
+            print('END: Unable to get the user: ' + str(r.get('error')))
+            return None
+        else:
+            return r
 
     def get_workspace_name(self):
         """Returns the name of the workspace you are searching"""
@@ -260,7 +286,7 @@ def find_messages(slack: SlackAPI, log_handler, rule, timeframe=cfg.ALL_TIME):
 
     for query in rule.get('strings'):
         message_list = slack.page_api_search(query, 'search.messages', 'messages', timeframe)
-        print('{} messages found matching: {}'.format(len(message_list), query))
+        print('{} messages found matching: {}'.format(len(message_list), query.replace('"', '')))
         for message in message_list:
             r = re.compile(rule.get('pattern'))
             if r.search(str(message.get('text'))):
@@ -269,6 +295,7 @@ def find_messages(slack: SlackAPI, log_handler, rule, timeframe=cfg.ALL_TIME):
                     'timestamp': convert_timestamp(message.get('ts')),
                     'channel_name': message.get('channel').get('name'),
                     'posted_by': message.get('username'),
+                    'match_string': r.search(str(message.get('text'))).group(0),
                     'text': message.get('text'),
                     'permalink': message.get('permalink')
                 }
@@ -292,18 +319,20 @@ def find_files(slack: SlackAPI, log_handler, rule, timeframe=cfg.ALL_TIME):
         print = builtins.print
     for query in rule.get('strings'):
         message_list = slack.page_api_search(query, 'search.files', 'files', timeframe)
-        print('{} files found matching: {}'.format(len(message_list), query))
+        print('{} files found matching: {}'.format(len(message_list), query.replace('"', '')))
         for fl in message_list:
             if rule.get('file_types'):
                 for file_type in rule.get('file_types'):
-                    if query.replace('\"', '').lower() in fl.get('name').lower()\
+                    if query.replace('\"', '').lower() in fl.get('name').lower() \
                             and file_type.lower() in fl.get('filetype').lower():
+                        user = slack.get_user_info(fl.get('user'))
                         results_dict = {
                             'file_id': fl.get('id'),
                             'timestamp': convert_timestamp(fl.get('timestamp')),
                             'name': fl.get('name'),
                             'mimetype': fl.get('mimetype'),
-                            'posted_by': fl.get('username'),
+                            'file_type': fl.get('filetype'),
+                            'posted_by': user.get('user').get('name'),
                             'created': fl.get('created'),
                             'preview': fl.get('preview'),
                             'permalink': fl.get('permalink')
@@ -311,13 +340,14 @@ def find_files(slack: SlackAPI, log_handler, rule, timeframe=cfg.ALL_TIME):
                         results.append(results_dict)
             else:
                 if query.replace('\"', '').lower() in fl.get('name').lower():
+                    user = slack.get_user_info(fl.get('user'))
                     results_dict = {
                         'file_id': fl.get('id'),
                         'timestamp': convert_timestamp(fl.get('timestamp')),
                         'name': fl.get('name'),
                         'mimetype': fl.get('mimetype'),
                         'file_type': fl.get('filetype'),
-                        'posted_by': fl.get('username'),
+                        'posted_by': user.get('user').get('name'),
                         'created': fl.get('created'),
                         'preview': fl.get('preview'),
                         'permalink': fl.get('permalink')
